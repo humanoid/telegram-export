@@ -1,9 +1,7 @@
 import configparser
 import logging
-from getpass import getpass
 
 from telethon import TelegramClient, utils
-from telethon.errors import SessionPasswordNeededError
 
 import downloader
 from dumper import Dumper
