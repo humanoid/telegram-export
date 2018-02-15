@@ -10,6 +10,24 @@ from telethon.utils import get_peer_id, resolve_id
 __log__ = logging.getLogger(__name__)
 
 
+def download_media(client, msg, target_id):
+    media = msg.media
+    os.makedirs('usermedia', exist_ok=True)
+    file_name_prefix = '%d-%d-' % (target_id, msg.id)
+    if isinstance(media, tl.MessageMediaDocument) and not hasattr(media.document, 'stickerset'):
+        file_name = file_name_prefix + next(a for a in media.document.attributes if isinstance(a, tl.DocumentAttributeFilename)).file_name
+        return client.download_media(
+            media,
+            file='usermedia/%s' % file_name
+        )
+    elif isinstance(media, tl.MessageMediaPhoto):
+        file_name = file_name_prefix + media.photo.date.strftime('photo_%Y-%m-%d_%H-%M-%S.jpg')
+        return client.download_media(
+            media,
+            file='usermedia/%s' % file_name
+        )
+
+
 def save_messages(client, dumper, target):
     target = client.get_input_entity(target)
     req = rpc.messages.GetHistoryRequest(
@@ -41,6 +59,8 @@ def save_messages(client, dumper, target):
 
         for m in history.messages:
             if isinstance(m, tl.Message):
+                if m.media:
+                    download_media(client, msg=m, target_id=target_id)
                 fwd_id = dumper.dump_forward(m.fwd_from)
                 media_id = dumper.dump_media(m.media)
                 dumper.dump_message(m, target_id,
