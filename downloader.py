@@ -11,21 +11,23 @@ __log__ = logging.getLogger(__name__)
 
 
 def download_media(client, msg, target_id):
-    media = msg.media
+    if isinstance(msg, tl.Message):
+        media = msg.media
+    else:
+        media = msg
     os.makedirs('usermedia', exist_ok=True)
-    file_name_prefix = '%d-%d-' % (target_id, msg.id)
+    file_name_prefix = 'usermedia/{}-{}-'.format(target_id, msg.id)
     if isinstance(media, tl.MessageMediaDocument) and not hasattr(media.document, 'stickerset'):
-        file_name = file_name_prefix + next(a for a in media.document.attributes if isinstance(a, tl.DocumentAttributeFilename)).file_name
-        return client.download_media(
-            media,
-            file='usermedia/%s' % file_name
-        )
+        file_name = file_name_prefix + next(
+            a for a in media.document.attributes
+            if isinstance(a, tl.DocumentAttributeFilename)
+        ).file_name
+        return client.download_media(media, file=file_name)
     elif isinstance(media, tl.MessageMediaPhoto):
         file_name = file_name_prefix + media.photo.date.strftime('photo_%Y-%m-%d_%H-%M-%S.jpg')
-        return client.download_media(
-            media,
-            file='usermedia/%s' % file_name
-        )
+        return client.download_media(media, file=file_name)
+    else:
+        return None
 
 
 def save_messages(client, dumper, target):
