@@ -1,46 +1,18 @@
 #!/bin/env python3
+import logging
 import os
 from time import sleep
 
 from telethon.extensions import BinaryReader
 from telethon.tl import types as tl, functions as rpc
-from telethon.utils import get_peer_id, resolve_id, get_display_name
+from telethon.utils import get_peer_id, resolve_id
 
-
-def get_file_location(obj):
-    if isinstance(obj, tl.Message):
-        if obj.media:
-            if isinstance(obj.media, tl.MessageMediaDocument):
-                return get_file_location(obj.media.document)
-            elif isinstance(obj.media, tl.MessageMediaPhoto):
-                return get_file_location(obj.media.photo)
-
-    elif isinstance(obj, tl.MessageService):
-        if isinstance(obj.action, tl.MessageActionChatEditPhoto):
-            return get_file_location(obj.action.photo)
-
-    elif isinstance(obj, (tl.User, tl.Chat, tl.Channel)):
-        return get_file_location(obj.photo)
-
-    elif isinstance(obj, tl.Photo):  # PhotoEmpty are ignored
-        # FileLocation or FileLocationUnavailable
-        return obj.sizes[-1].location
-
-    elif isinstance(obj, (tl.UserProfilePhoto, tl.ChatPhoto)):
-        # FileLocation or FileLocationUnavailable
-        # If the latter we could test whether obj.photo_small is more worthy
-        return obj.photo_big
-
-    elif isinstance(obj, tl.Document):  # DocumentEmpty are ignored
-        return tl.InputDocumentFileLocation(
-            id=obj.id,
-            access_hash=obj.access_hash,
-            version=obj.version
-        )
+__log__ = logging.getLogger(__name__)
 
 
 def save_messages(client, dumper, target):
-    request = rpc.messages.GetHistoryRequest(
+    target = client.get_input_entity(target)
+    req = rpc.messages.GetHistoryRequest(
         peer=target,
         offset_id=0,
         offset_date=None,
@@ -50,132 +22,113 @@ def save_messages(client, dumper, target):
         min_id=0,
         hash=0
     )
-    print('Starting with', get_display_name(target))
+    __log__.info('Starting dump with %s', target)
 
-    target_id = get_peer_id(target)
+    target_id = 0 if isinstance(target, tl.InputPeerSelf) else get_peer_id(target)
     chunks_left = dumper.max_chunks
 
-    # Resume from the last dumped message. It's important to
-    # remember that we go -> 0, although it can be confusing.
-    latest = dumper.get_last_dumped_message(target_id)
-    if latest:
-        print('Resuming at', latest.date, '(', latest.id, ')')
-        # Offset is exclusive, which makes it easier
-        request.offset_id = latest.id
-        request.offset_date = latest.date
-
-    # Stop as soon as we reach the highest ID we already have.
-    # If we don't have such ID, we must reach the end or until
-    # we don't receive any more messages.
-    stop_at = getattr(dumper.get_message(target_id, 'MAX'), 'id', 0)
-
-    # OR if the offset is SMALLER than which we should stop at, it
-    # means we're AFTER that limit, which means we haven't finished
-    # reaching the end. If this is the case, we should stop at 0.
-    if latest and latest.id <= stop_at:
-        stop_at = 0
+    req.offset_id, req.offset_date, stop_at = dumper.get_resume(target_id)
+    if req.offset_id:
+        __log__.info('Resuming at %s (%s)', req.offset_date, req.offset_id)
 
     found = dumper.get_message_count(target_id)
     entities = {}
     while True:
         # TODO How should edits be handled? Always read first two days?
-        history = client(request)
+        history = client(req)
         entities.update({get_peer_id(c): c for c in history.chats})
         entities.update({get_peer_id(u): u for u in history.users})
 
         for m in history.messages:
-            file_location = get_file_location(m)
-            if file_location:
-                media_id = dumper.dump_filelocation(file_location)
-            else:
-                media_id = None
-
             if isinstance(m, tl.Message):
-                m.to_id = get_peer_id(m.to_id)
-                if m.fwd_from:
-                    fwd_id = dumper.dump_forward(m.fwd_from)
-                else:
-                    fwd_id = None
-
-                dumper.dump_message(m, forward_id=fwd_id, media_id=media_id)
+                fwd_id = dumper.dump_forward(m.fwd_from)
+                media_id = dumper.dump_media(m.media)
+                dumper.dump_message(m, target_id,
+                                    forward_id=fwd_id, media_id=media_id)
 
             elif isinstance(m, tl.MessageService):
-                m.to_id = get_peer_id(m.to_id)
-                dumper.dump_message_service(m, media_id=media_id)
+                dumper.dump_message_service(m, media_id=None)
 
             else:
-                print('Skipping message', type(m).__name__)
+                __log__.warning('Skipping message %s', m)
                 continue
 
         total_messages = getattr(history, 'count', len(history.messages))
         if history.messages:
             # We may reinsert some we already have (so found > total)
             found = min(found + len(history.messages), total_messages)
-            request.offset_id = min(m.id for m in history.messages)
-            request.offset_date = min(m.date for m in history.messages)
+            req.offset_id = min(m.id for m in history.messages)
+            req.offset_date = min(m.date for m in history.messages)
 
-        print('Downloaded {}/{} ({:.1%})'.format(
+        __log__.debug('Downloaded {}/{} ({:.1%})'.format(
             found, total_messages, found / total_messages
         ))
 
-        # Keep track of the last target ID (smallest one),
-        # so we can resume from here in case of interruption.
-        dumper.update_last_dumped_message(target_id, request.offset_id)
-
-        if len(history.messages) < request.limit:
-            print('Received less messages than limit, done.')
+        if len(history.messages) < req.limit:
+            __log__.info('Received less messages than limit, done.')
             # Receiving less messages than the limit means we have reached
             # the end, so we need to exit. Next time we'll start from offset
             # 0 again so we can check for new messages.
-            # TODO should we loop again and check for new messages?
-            # If the conversation is alive, this may never end, unsure.
+            max_msg = dumper.get_message(target_id, 'MAX')
+            dumper.save_resume(target_id, stop_at=max_msg.id)
             break
 
         # We dump forward (message ID going towards 0), so as soon
         # as the minimum message ID (now in offset ID) is less than
         # the highest ID ("closest" bound we need to reach), stop.
-        if request.offset_id <= stop_at:
-            print('Already have the rest of messages, done.')
+        if req.offset_id <= stop_at:
+            __log__.info('Reached already-dumped messages, done.')
+            max_msg = dumper.get_message(target_id, 'MAX')
+            dumper.save_resume(target_id, stop_at=max_msg.id)
             break
+
+        # Keep track of the last target ID (smallest one),
+        # so we can resume from here in case of interruption.
+        dumper.save_resume(
+            target_id, msg=req.offset_id, msg_date=req.offset_date,
+            stop_at=stop_at  # We DO want to preserve stop_at though.
+        )
 
         chunks_left -= 1  # 0 means infinite, will reach -1 and never 0
         if chunks_left == 0:
-            print('Reached maximum amount of chunks, done.')
+            __log__.info('Reached maximum amount of chunks, done.')
+            break
 
         sleep(1)
 
-    # Set the last message to 0, as we must start again next time.
-    dumper.update_last_dumped_message(target_id, 0)
-
-    print('Done. Retrieving full information about entities.')
+    __log__.info('Done. Retrieving full information about entities.')
     # TODO Save their profile picture
     for mid, entity in entities.items():
-        file_location = get_file_location(entity)
-        if file_location:
-            photo_id = dumper.dump_filelocation(file_location)
-        else:
-            photo_id = None
-
         eid, etype = resolve_id(mid)
         if etype == tl.PeerUser:
-            if entity.deleted:
+            if entity.deleted or entity.min:
                 continue
                 # Otherwise, the empty first name causes an IntegrityError
             full_user = client(rpc.users.GetFullUserRequest(entity))
             sleep(1)
+            photo_id = dumper.dump_media(full_user.profile_photo)
             dumper.dump_user(full_user, photo_id=photo_id)
 
         elif etype == tl.PeerChat:
+            if isinstance(entity, tl.Chat):
+                photo_id = dumper.dump_media(entity.photo)
+            else:
+                photo_id = None
             dumper.dump_chat(entity, photo_id=photo_id)
 
         elif etype == tl.PeerChannel:
+            if hasattr(entity, 'left') and entity.left:
+                continue
             full_channel = client(rpc.channels.GetFullChannelRequest(entity))
             sleep(1)
+            photo_id = dumper.dump_media(full_channel.chat_photo)
             if entity.megagroup:
                 dumper.dump_supergroup(full_channel, entity, photo_id=photo_id)
             else:
-                dumper.dump_channel(full_channel.full_chat, entity, photo_id=photo_id)
-    print('Done!\n')
+                dumper.dump_channel(full_channel.full_chat, entity,
+                                    photo_id=photo_id)
+
+    __log__.info('Dump with %s finished', target)
 
 
 def fetch_dialogs(client, cache_file='dialogs.tl', force=False):

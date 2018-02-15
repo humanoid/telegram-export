@@ -17,21 +17,21 @@ logger.setLevel(logging.DEBUG)
 
 def load_config():
     # Load from file
-    defaults = {'ForceNoChangeDumpAfter': 7200,'DBFileName': 'export'}
-    config = configparser.ConfigParser(defaults)
+    config = configparser.ConfigParser()
     config.read('config.ini')
 
     # Convert minutes to seconds
     config['Dumper']['ForceNoChangeDumpAfter'] = str(
-        config.getint('Dumper', 'ForceNoChangeDumpAfter') * 60)
+        config['Dumper'].getint('ForceNoChangeDumpAfter', 7200) * 60)
 
     return config
 
 
-if __name__ == '__main__':
+def main():
     config = load_config()
     dumper = Dumper(config['Dumper'])
     config = config['TelegramAPI']
+    cache_file = config['SessionName'] + '.tl'
 
     client = TelegramClient(
         config['SessionName'], config['ApiId'], config['ApiHash']
@@ -47,19 +47,29 @@ if __name__ == '__main__':
 
         if 'Whitelist' in dumper.config:
             # Only whitelist, don't even get the dialogs
-            entities = downloader.load_entities_from_str(client, dumper.config['Whitelist'])
-            entities = client.get_entity(entities)  # Into full, to show name
+            entities = downloader.load_entities_from_str(
+                client, dumper.config['Whitelist']
+            )
             for who in entities:
                 downloader.save_messages(client, dumper, who)
-        else:
+        elif 'Blacklist' in dumper.config:
             # May be blacklist, so save the IDs on who to avoid
-            entities = downloader.load_entities_from_str(client, dumper.config['Blacklist'])
+            entities = downloader.load_entities_from_str(
+                client, dumper.config['Blacklist']
+            )
             avoid = set(utils.get_peer_id(x) for x in entities)
-            for entity in downloader.fetch_dialogs(client):
+            for entity in downloader.fetch_dialogs(client, cache_file=cache_file):
                 if utils.get_peer_id(entity) not in avoid:
                     downloader.save_messages(client, dumper, entity)
+        else:
+            # Neither blacklist nor whitelist - get all
+            for entity in downloader.fetch_dialogs(client):
+                downloader.save_messages(client, dumper, entity)
     except KeyboardInterrupt:
         pass
     finally:
-        print('Done, disconnecting...')
         client.disconnect()
+
+
+if __name__ == '__main__':
+    main()
